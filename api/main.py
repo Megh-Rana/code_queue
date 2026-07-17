@@ -1,22 +1,30 @@
+import os
+import secrets
 import uuid
 from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, field_validator
 
 # ---------------------------------------------------------------------------
 # App & Redis setup
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Code Queue API", version="1.1.0")
+app = FastAPI(title="Code Queue API", version="1.2.0")
 
 redis_client: aioredis.Redis | None = None
 
 QUEUE_KEY = "job_queue"
 DEAD_LETTER_KEY = "dead_letter_queue"
 JOB_KEY_PREFIX = "job:"
+API_KEYS_SET = "api_keys"
 DEFAULT_MAX_ATTEMPTS = 3
+
+# Seed key loaded from environment — added to Redis on startup so the first
+# caller is never locked out. If unset, a random key is generated and logged.
+SEED_API_KEY = os.getenv("SEED_API_KEY")
 
 
 @app.on_event("startup")
@@ -28,11 +36,52 @@ async def startup() -> None:
         decode_responses=True,
     )
 
+    # Bootstrap the seed key
+    key = SEED_API_KEY or secrets.token_urlsafe(32)
+    await redis_client.sadd(API_KEYS_SET, key)
+
+    if not SEED_API_KEY:
+        # Log it so the operator can retrieve it from container logs
+        print(f"\n{'='*60}")
+        print(f"  No SEED_API_KEY set. Generated key for this session:")
+        print(f"  {key}")
+        print(f"{'='*60}\n", flush=True)
+
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
     if redis_client:
         await redis_client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Auth dependency
+# ---------------------------------------------------------------------------
+
+_bearer_scheme = HTTPBearer(auto_error=False)
+
+
+async def require_api_key(
+    credentials: HTTPAuthorizationCredentials | None = Security(_bearer_scheme),
+) -> str:
+    """Validate Bearer token against the Redis api_keys set."""
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or malformed Authorization header. Expected: Bearer <api-key>",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    key = credentials.credentials
+    is_valid = await redis_client.sismember(API_KEYS_SET, key)
+    if not is_valid:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return key
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +126,10 @@ class JobResponse(BaseModel):
     last_error: str | None
 
 
+class ApiKeyResponse(BaseModel):
+    key: str
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -104,11 +157,49 @@ def _to_job_response(data: dict) -> JobResponse:
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Auth management routes  (/auth/keys)
+# ---------------------------------------------------------------------------
+
+@app.post("/auth/keys", response_model=ApiKeyResponse, status_code=201)
+async def create_api_key(_key: str = Depends(require_api_key)):
+    """Generate a new API key and add it to the active set."""
+    new_key = secrets.token_urlsafe(32)
+    await redis_client.sadd(API_KEYS_SET, new_key)
+    return ApiKeyResponse(key=new_key)
+
+
+@app.get("/auth/keys", response_model=list[str])
+async def list_api_keys(_key: str = Depends(require_api_key)):
+    """List all active API keys."""
+    keys = await redis_client.smembers(API_KEYS_SET)
+    return sorted(keys)
+
+
+@app.delete("/auth/keys/{target_key}", status_code=204)
+async def revoke_api_key(target_key: str, current_key: str = Depends(require_api_key)):
+    """
+    Revoke an API key. Prevents revoking the key currently in use to avoid
+    accidental self-lockout.
+    """
+    if target_key == current_key:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot revoke the API key you are currently using.",
+        )
+    removed = await redis_client.srem(API_KEYS_SET, target_key)
+    if not removed:
+        raise HTTPException(status_code=404, detail="API key not found.")
+
+
+# ---------------------------------------------------------------------------
+# Job routes  (all protected)
 # ---------------------------------------------------------------------------
 
 @app.post("/jobs", response_model=JobResponse, status_code=201)
-async def submit_job(submission: JobSubmission):
+async def submit_job(
+    submission: JobSubmission,
+    _key: str = Depends(require_api_key),
+):
     """Submit a code snippet for async processing."""
     job_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -146,9 +237,8 @@ async def submit_job(submission: JobSubmission):
 
 
 @app.get("/jobs/dead-letter", response_model=list[JobResponse])
-async def list_dead_letter_jobs():
+async def list_dead_letter_jobs(_key: str = Depends(require_api_key)):
     """List all jobs in the dead-letter queue (permanently failed)."""
-    # LRANGE returns all job IDs in the dead-letter list
     job_ids = await redis_client.lrange(DEAD_LETTER_KEY, 0, -1)
     if not job_ids:
         return []
@@ -158,58 +248,51 @@ async def list_dead_letter_jobs():
         data = await redis_client.hgetall(f"{JOB_KEY_PREFIX}{job_id}")
         if data:
             jobs.append(_to_job_response(data))
-
     return jobs
 
 
-@app.post("/jobs/{job_id}/retry", response_model=JobResponse, status_code=200)
-async def retry_dead_letter_job(job_id: str):
-    """
-    Re-queue a dead-lettered job for processing.
-    Resets attempt counter and removes the job from the dead-letter list.
-    """
+@app.post("/jobs/{job_id}/retry", response_model=JobResponse)
+async def retry_dead_letter_job(
+    job_id: str,
+    _key: str = Depends(require_api_key),
+):
+    """Re-queue a dead-lettered job. Resets attempt counter."""
     data = await get_job_or_404(job_id)
 
     if data.get("status") != "failed":
         raise HTTPException(
             status_code=409,
-            detail=f"Job '{job_id}' is not in failed state (current status: {data.get('status')}). "
-                   "Only failed jobs can be manually retried.",
+            detail=(
+                f"Job '{job_id}' is not in failed state "
+                f"(current status: {data.get('status')}). "
+                "Only failed jobs can be manually retried."
+            ),
         )
 
     now = datetime.now(timezone.utc).isoformat()
 
     async with redis_client.pipeline(transaction=True) as pipe:
-        # Reset job state for a fresh attempt
         pipe.hset(
             f"{JOB_KEY_PREFIX}{job_id}",
-            mapping={
-                "status": "pending",
-                "attempt": "0",
-                "last_error": "",
-                "updated_at": now,
-            },
+            mapping={"status": "pending", "attempt": "0", "last_error": "", "updated_at": now},
         )
-        # Remove from dead-letter list
         pipe.lrem(DEAD_LETTER_KEY, 0, job_id)
-        # Push back onto main queue
         pipe.lpush(QUEUE_KEY, job_id)
         await pipe.execute()
 
-    # Re-fetch and return updated state
     updated = await redis_client.hgetall(f"{JOB_KEY_PREFIX}{job_id}")
     return _to_job_response(updated)
 
 
 @app.get("/jobs/{job_id}", response_model=JobResponse)
-async def get_job(job_id: str):
+async def get_job(job_id: str, _key: str = Depends(require_api_key)):
     """Get the current status and result of a job."""
     data = await get_job_or_404(job_id)
     return _to_job_response(data)
 
 
 @app.get("/jobs", response_model=list[JobResponse])
-async def list_jobs():
+async def list_jobs(_key: str = Depends(require_api_key)):
     """List all jobs (scans Redis — for dev/debug use)."""
     keys = await redis_client.keys(f"{JOB_KEY_PREFIX}*")
     if not keys:
@@ -227,6 +310,6 @@ async def list_jobs():
 
 @app.get("/health")
 async def health():
-    """Health check — also pings Redis."""
+    """Health check — no auth required."""
     await redis_client.ping()
     return {"status": "ok", "redis": "ok"}

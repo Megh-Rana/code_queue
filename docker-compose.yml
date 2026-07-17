@@ -21,6 +21,9 @@ services:
       - "8000:8000"
     environment:
       - REDIS_URL=redis://redis:6379
+      # Set SEED_API_KEY to a known value for local dev.
+      # If unset, a random key is generated and printed to the API container logs on startup.
+      - SEED_API_KEY=changeme-local-dev-key
     depends_on:
       redis:
         condition: service_healthy

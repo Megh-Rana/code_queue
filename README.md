@@ -29,6 +29,54 @@ POST /jobs  ──►  Redis List (job_queue)  ──►  Worker (BRPOP)
 
 ---
 
+## Authentication
+
+All job endpoints require an API key passed as a Bearer token:
+
+```
+Authorization: Bearer <api-key>
+```
+
+The default local dev key is set in `docker-compose.yml`:
+
+```
+SEED_API_KEY=changeme-local-dev-key
+```
+
+If `SEED_API_KEY` is not set, a random key is generated on startup and printed to the API container logs:
+
+```bash
+docker compose logs api | grep "Generated key"
+```
+
+### Key management
+
+All key management endpoints also require a valid API key.
+
+**Create a new key:**
+```bash
+curl -s -X POST http://localhost:8000/auth/keys \
+  -H "Authorization: Bearer changeme-local-dev-key" | jq
+# {"key": "newly-generated-key..."}
+```
+
+**List active keys:**
+```bash
+curl -s http://localhost:8000/auth/keys \
+  -H "Authorization: Bearer changeme-local-dev-key" | jq
+```
+
+**Revoke a key:**
+```bash
+curl -s -X DELETE http://localhost:8000/auth/keys/<key-to-revoke> \
+  -H "Authorization: Bearer changeme-local-dev-key"
+# 204 No Content
+```
+
+> You cannot revoke the key you are currently using — the API returns `400` to prevent self-lockout.
+
+---
+
 ## Quick Start
 
 **Prerequisites:** Docker and Docker Compose v2.
@@ -53,6 +101,7 @@ Interactive docs (Swagger UI) at `http://localhost:8000/docs`.
 ```bash
 curl -s -X POST http://localhost:8000/jobs \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer changeme-local-dev-key" \
   -d '{"code": "print(\"Hello, World!\")", "language": "python"}' | jq
 ```
 
@@ -75,7 +124,8 @@ Response:
 ### Check job status
 
 ```bash
-curl -s http://localhost:8000/jobs/<job_id> | jq
+curl -s http://localhost:8000/jobs/<job_id> \
+  -H "Authorization: Bearer changeme-local-dev-key" | jq
 ```
 
 Possible `status` values:
@@ -90,7 +140,8 @@ Possible `status` values:
 ### List all jobs
 
 ```bash
-curl -s http://localhost:8000/jobs | jq
+curl -s http://localhost:8000/jobs \
+  -H "Authorization: Bearer changeme-local-dev-key" | jq
 ```
 
 > Uses Redis `KEYS` scan — fine for dev/debug, not for production at scale.
@@ -123,7 +174,8 @@ After exhausting all attempts, the job is moved to the **dead-letter queue** and
 ### List dead-lettered jobs
 
 ```bash
-curl -s http://localhost:8000/jobs/dead-letter | jq
+curl -s http://localhost:8000/jobs/dead-letter \
+  -H "Authorization: Bearer changeme-local-dev-key" | jq
 ```
 
 ### Manually retry a dead-lettered job
@@ -131,7 +183,8 @@ curl -s http://localhost:8000/jobs/dead-letter | jq
 Resets the attempt counter and re-queues the job for a fresh run.
 
 ```bash
-curl -s -X POST http://localhost:8000/jobs/<job_id>/retry | jq
+curl -s -X POST http://localhost:8000/jobs/<job_id>/retry \
+  -H "Authorization: Bearer changeme-local-dev-key" | jq
 ```
 
 Returns `409` if the job is not in `failed` state.
@@ -166,7 +219,6 @@ docker compose down
 
 - **Real execution** — Replace the simulated worker with a sandboxed runner (e.g., subprocess with resource limits, or ephemeral containers via Docker-in-Docker).
 - **Persistence** — Add a Redis volume in `docker-compose.yml` so jobs survive restarts.
-- **Authentication** — Add API key or JWT auth to the FastAPI layer.
 - **Redis Streams** — Upgrade from a List to Redis Streams for consumer groups, message acknowledgment, and replay.
 
 ---
