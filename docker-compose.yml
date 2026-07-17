@@ -1,0 +1,42 @@
+services:
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: code_queue_redis
+    ports:
+      - "6379:6379"         # expose for local redis-cli inspection
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: code_queue_api
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: code_queue_worker
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+# All services share the default bridge network created by Compose.
+# They can reach each other by service name (e.g. "redis", "api").
