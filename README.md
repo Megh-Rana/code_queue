@@ -193,7 +193,26 @@ Returns `409` if the job is not in `failed` state.
 
 ## Supported Languages
 
-`python`, `javascript`, `java`, `c`, `cpp`, `go`, `ruby`, `rust`
+| Language | Execution | Runtime |
+|---|---|---|
+| `python` | Real | python3 |
+| `javascript` | Real | Node.js |
+| `c` | Real | gcc |
+| `cpp` | Real | g++ |
+| `go` | Real | Go 1.22 |
+| `ruby` | Real | ruby |
+| `java` | Simulated | (heavy runtime — future scope) |
+| `rust` | Simulated | (heavy runtime — future scope) |
+
+### Execution limits
+
+| Limit | Default | Env var |
+|---|---|---|
+| Wall-clock timeout | 10s | `EXEC_TIMEOUT` |
+| Memory (heap) | 256 MB | `MEM_LIMIT_MB` |
+| Max output size | 10 KB | `MAX_OUTPUT_BYTES` |
+
+Jobs that exceed the timeout exit with code `124`. Output beyond the cap is truncated with a notice.
 
 ---
 
@@ -217,7 +236,7 @@ docker compose down
 
 ## Future Scope
 
-- **Real execution** — Replace the simulated worker with a sandboxed runner (e.g., subprocess with resource limits, or ephemeral containers via Docker-in-Docker).
+- **Java / Rust execution** — Heavy runtimes (~300 MB+); add `rustup` and a JDK to the worker image when needed.
 - **Persistence** — Add a Redis volume in `docker-compose.yml` so jobs survive restarts.
 - **Redis Streams** — Upgrade from a List to Redis Streams for consumer groups, message acknowledgment, and replay.
 
