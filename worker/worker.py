@@ -6,6 +6,11 @@ Queue strategy: Redis List with BRPOP (blocking right-pop).
   - Worker pops from the right       (BRPOP job_queue)
   → FIFO order
 
+Retry strategy: exponential backoff.
+  - On failure, re-queue the job after 2^attempt seconds (2s, 4s, 8s, ...)
+  - After MAX_ATTEMPTS failures, move the job to the dead-letter list and
+    mark status = "failed". No further processing.
+
 Future scope: replace _simulate_execution() with a real sandboxed runner
 (e.g., subprocess + resource limits, or a container-per-job approach).
 """
@@ -37,8 +42,10 @@ log = logging.getLogger("worker")
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
 QUEUE_KEY = "job_queue"
+DEAD_LETTER_KEY = "dead_letter_queue"
 JOB_KEY_PREFIX = "job:"
-BRPOP_TIMEOUT = 5  # seconds — unblocks periodically so shutdown signal is checked
+BRPOP_TIMEOUT = 5       # seconds — unblocks periodically so shutdown signal is checked
+MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
 
 # ---------------------------------------------------------------------------
 # Simulated execution
@@ -79,7 +86,44 @@ def _simulate_execution(language: str, code: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Core processing loop
+# Retry / dead-letter helpers
+# ---------------------------------------------------------------------------
+
+def _backoff_seconds(attempt: int) -> float:
+    """Exponential backoff: 2^attempt seconds (2, 4, 8, ...)."""
+    return float(2 ** attempt)
+
+
+def _requeue_with_backoff(r: redis.Redis, job_id: str, attempt: int) -> None:
+    """Sleep the backoff duration, then push the job back onto the main queue."""
+    delay = _backoff_seconds(attempt)
+    log.info(
+        "Job %s failed on attempt %d — retrying in %.0fs (backoff)...",
+        job_id, attempt, delay,
+    )
+    time.sleep(delay)
+    r.lpush(QUEUE_KEY, job_id)
+    log.info("Job %s re-queued for attempt %d.", job_id, attempt + 1)
+
+
+def _move_to_dead_letter(r: redis.Redis, job_id: str, error: str) -> None:
+    """Mark job as permanently failed and add to dead-letter list."""
+    key = f"{JOB_KEY_PREFIX}{job_id}"
+    now = datetime.now(timezone.utc).isoformat()
+    r.hset(
+        key,
+        mapping={
+            "status": "failed",
+            "last_error": error,
+            "updated_at": now,
+        },
+    )
+    r.lpush(DEAD_LETTER_KEY, job_id)
+    log.warning("Job %s exhausted all retries — moved to dead-letter queue.", job_id)
+
+
+# ---------------------------------------------------------------------------
+# Core processing
 # ---------------------------------------------------------------------------
 
 def process_job(r: redis.Redis, job_id: str) -> None:
@@ -94,31 +138,49 @@ def process_job(r: redis.Redis, job_id: str) -> None:
 
     language = job.get("language", "unknown")
     code = job.get("code", "")
+    attempt = int(job.get("attempt", "0")) + 1   # increment on each dequeue
+    max_attempts = int(job.get("max_attempts", str(MAX_ATTEMPTS)))
 
-    log.info("Processing job %s [language=%s]", job_id, language)
+    log.info(
+        "Processing job %s [language=%s, attempt=%d/%d]",
+        job_id, language, attempt, max_attempts,
+    )
 
-    # Mark as processing
-    r.hset(key, mapping={"status": "processing", "updated_at": now})
+    # Record attempt count and mark as processing
+    r.hset(key, mapping={"status": "processing", "attempt": attempt, "updated_at": now})
 
     try:
         result = _simulate_execution(language, code)
-        status = "done"
     except Exception as exc:
-        log.exception("Unexpected error processing job %s", job_id)
-        result = f"Internal worker error: {exc}"
-        status = "error"
+        error_msg = f"{type(exc).__name__}: {exc}"
+        log.exception("Job %s failed on attempt %d/%d", job_id, attempt, max_attempts)
 
-    # Write result
+        # Update last_error regardless of whether we retry or dead-letter
+        r.hset(key, mapping={"last_error": error_msg, "updated_at": datetime.now(timezone.utc).isoformat()})
+
+        if attempt < max_attempts:
+            r.hset(key, mapping={"status": "pending"})
+            _requeue_with_backoff(r, job_id, attempt)
+        else:
+            _move_to_dead_letter(r, job_id, error_msg)
+        return
+
+    # Success
     r.hset(
         key,
         mapping={
-            "status": status,
+            "status": "done",
             "result": result,
+            "last_error": "",
             "updated_at": datetime.now(timezone.utc).isoformat(),
         },
     )
-    log.info("Job %s finished with status=%s", job_id, status)
+    log.info("Job %s completed successfully on attempt %d.", job_id, attempt)
 
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
 def run(r: redis.Redis) -> None:
     log.info("Worker started. Listening on queue '%s'...", QUEUE_KEY)
@@ -127,7 +189,6 @@ def run(r: redis.Redis) -> None:
         # BRPOP returns (key, value) or None on timeout
         item = r.brpop(QUEUE_KEY, timeout=BRPOP_TIMEOUT)
         if item is None:
-            # Timeout — loop back so we can check for shutdown signals
             continue
 
         _, job_id = item

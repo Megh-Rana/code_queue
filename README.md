@@ -14,8 +14,13 @@ Client
   ▼
 POST /jobs  ──►  Redis List (job_queue)  ──►  Worker (BRPOP)
                  Redis Hash (job:{id})  ◄──────────────┘
-  ▲                     │
-  └──  GET /jobs/{id}  ─┘
+  ▲                     │                       │ (on failure)
+  └──  GET /jobs/{id}  ─┘               re-queue w/ backoff
+                                                │ (exhausted)
+                                        Redis List (dead_letter_queue)
+                                                │
+                                        GET /jobs/dead-letter
+                                        POST /jobs/{id}/retry
 ```
 
 - **API** (`api/`) — FastAPI service. Accepts submissions, stores job state in Redis, exposes status endpoints.
@@ -60,7 +65,10 @@ Response:
   "code": "print(\"Hello, World!\")",
   "result": null,
   "created_at": "2026-07-17T13:51:00+00:00",
-  "updated_at": null
+  "updated_at": null,
+  "attempt": 0,
+  "max_attempts": 3,
+  "last_error": null
 }
 ```
 
@@ -77,7 +85,7 @@ Possible `status` values:
 | `pending` | Queued, not yet picked up |
 | `processing` | Worker is currently executing |
 | `done` | Finished — check `result` field |
-| `error` | Worker hit an unexpected error |
+| `failed` | Exhausted all retry attempts — check `last_error` field |
 
 ### List all jobs
 
@@ -93,6 +101,40 @@ curl -s http://localhost:8000/jobs | jq
 curl -s http://localhost:8000/health
 # {"status":"ok","redis":"ok"}
 ```
+
+---
+
+## Retries & Dead-Letter Queue
+
+When a job fails, the worker automatically retries it with **exponential backoff** before giving up.
+
+**Backoff schedule** (default `MAX_ATTEMPTS=3`):
+
+| Attempt | Delay before retry |
+|---|---|
+| 1 → 2 | 2 seconds |
+| 2 → 3 | 4 seconds |
+| 3 (final) | — moved to dead-letter queue |
+
+After exhausting all attempts, the job is moved to the **dead-letter queue** and its status is set to `failed`. The `last_error` field contains the error from the final attempt.
+
+`MAX_ATTEMPTS` is configurable via an environment variable in `docker-compose.yml`.
+
+### List dead-lettered jobs
+
+```bash
+curl -s http://localhost:8000/jobs/dead-letter | jq
+```
+
+### Manually retry a dead-lettered job
+
+Resets the attempt counter and re-queues the job for a fresh run.
+
+```bash
+curl -s -X POST http://localhost:8000/jobs/<job_id>/retry | jq
+```
+
+Returns `409` if the job is not in `failed` state.
 
 ---
 
@@ -126,7 +168,6 @@ docker compose down
 - **Persistence** — Add a Redis volume in `docker-compose.yml` so jobs survive restarts.
 - **Authentication** — Add API key or JWT auth to the FastAPI layer.
 - **Redis Streams** — Upgrade from a List to Redis Streams for consumer groups, message acknowledgment, and replay.
-- **Retries & dead-letter queue** — Re-queue failed jobs with backoff; move permanently failed jobs to a dead-letter list.
 
 ---
 

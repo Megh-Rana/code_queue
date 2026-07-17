@@ -1,5 +1,4 @@
 import uuid
-import json
 from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
@@ -10,13 +9,14 @@ from pydantic import BaseModel, field_validator
 # App & Redis setup
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Code Queue API", version="1.0.0")
+app = FastAPI(title="Code Queue API", version="1.1.0")
 
-# Connection is created once at startup and reused across requests.
 redis_client: aioredis.Redis | None = None
 
 QUEUE_KEY = "job_queue"
+DEAD_LETTER_KEY = "dead_letter_queue"
 JOB_KEY_PREFIX = "job:"
+DEFAULT_MAX_ATTEMPTS = 3
 
 
 @app.on_event("startup")
@@ -72,6 +72,9 @@ class JobResponse(BaseModel):
     result: str | None
     created_at: str
     updated_at: str | None
+    attempt: int
+    max_attempts: int
+    last_error: str | None
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +88,21 @@ async def get_job_or_404(job_id: str) -> dict:
     return data
 
 
+def _to_job_response(data: dict) -> JobResponse:
+    return JobResponse(
+        job_id=data["job_id"],
+        status=data["status"],
+        language=data["language"],
+        code=data["code"],
+        result=data.get("result") or None,
+        created_at=data["created_at"],
+        updated_at=data.get("updated_at") or None,
+        attempt=int(data.get("attempt", 0)),
+        max_attempts=int(data.get("max_attempts", DEFAULT_MAX_ATTEMPTS)),
+        last_error=data.get("last_error") or None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -95,7 +113,6 @@ async def submit_job(submission: JobSubmission):
     job_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
-    # Store empty strings in Redis (hashes don't support null values)
     job_data = {
         "job_id": job_id,
         "status": "pending",
@@ -104,9 +121,11 @@ async def submit_job(submission: JobSubmission):
         "result": "",
         "created_at": now,
         "updated_at": "",
+        "attempt": "0",
+        "max_attempts": str(DEFAULT_MAX_ATTEMPTS),
+        "last_error": "",
     }
 
-    # Persist job state and enqueue atomically via pipeline
     async with redis_client.pipeline(transaction=True) as pipe:
         pipe.hset(f"{JOB_KEY_PREFIX}{job_id}", mapping=job_data)
         pipe.lpush(QUEUE_KEY, job_id)
@@ -120,22 +139,73 @@ async def submit_job(submission: JobSubmission):
         result=None,
         created_at=now,
         updated_at=None,
+        attempt=0,
+        max_attempts=DEFAULT_MAX_ATTEMPTS,
+        last_error=None,
     )
+
+
+@app.get("/jobs/dead-letter", response_model=list[JobResponse])
+async def list_dead_letter_jobs():
+    """List all jobs in the dead-letter queue (permanently failed)."""
+    # LRANGE returns all job IDs in the dead-letter list
+    job_ids = await redis_client.lrange(DEAD_LETTER_KEY, 0, -1)
+    if not job_ids:
+        return []
+
+    jobs = []
+    for job_id in job_ids:
+        data = await redis_client.hgetall(f"{JOB_KEY_PREFIX}{job_id}")
+        if data:
+            jobs.append(_to_job_response(data))
+
+    return jobs
+
+
+@app.post("/jobs/{job_id}/retry", response_model=JobResponse, status_code=200)
+async def retry_dead_letter_job(job_id: str):
+    """
+    Re-queue a dead-lettered job for processing.
+    Resets attempt counter and removes the job from the dead-letter list.
+    """
+    data = await get_job_or_404(job_id)
+
+    if data.get("status") != "failed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job '{job_id}' is not in failed state (current status: {data.get('status')}). "
+                   "Only failed jobs can be manually retried.",
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    async with redis_client.pipeline(transaction=True) as pipe:
+        # Reset job state for a fresh attempt
+        pipe.hset(
+            f"{JOB_KEY_PREFIX}{job_id}",
+            mapping={
+                "status": "pending",
+                "attempt": "0",
+                "last_error": "",
+                "updated_at": now,
+            },
+        )
+        # Remove from dead-letter list
+        pipe.lrem(DEAD_LETTER_KEY, 0, job_id)
+        # Push back onto main queue
+        pipe.lpush(QUEUE_KEY, job_id)
+        await pipe.execute()
+
+    # Re-fetch and return updated state
+    updated = await redis_client.hgetall(f"{JOB_KEY_PREFIX}{job_id}")
+    return _to_job_response(updated)
 
 
 @app.get("/jobs/{job_id}", response_model=JobResponse)
 async def get_job(job_id: str):
     """Get the current status and result of a job."""
     data = await get_job_or_404(job_id)
-    return JobResponse(
-        job_id=data["job_id"],
-        status=data["status"],
-        language=data["language"],
-        code=data["code"],
-        result=data["result"] or None,
-        created_at=data["created_at"],
-        updated_at=data["updated_at"] or None,
-    )
+    return _to_job_response(data)
 
 
 @app.get("/jobs", response_model=list[JobResponse])
@@ -149,19 +219,8 @@ async def list_jobs():
     for key in keys:
         data = await redis_client.hgetall(key)
         if data:
-            jobs.append(
-                JobResponse(
-                    job_id=data["job_id"],
-                    status=data["status"],
-                    language=data["language"],
-                    code=data["code"],
-                    result=data["result"] or None,
-                    created_at=data["created_at"],
-                    updated_at=data["updated_at"] or None,
-                )
-            )
+            jobs.append(_to_job_response(data))
 
-    # Sort newest first
     jobs.sort(key=lambda j: j.created_at, reverse=True)
     return jobs
 
